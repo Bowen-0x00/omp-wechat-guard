@@ -1,0 +1,25 @@
+# omp 企业微信推送与远程控制助手配置模板
+wechat:
+  corp_id: "YOUR_CORP_ID"
+  agent_id: 1000006
+  secret: "YOUR_SECRET"
+  token: "YOUR_TOKEN"
+  encoding_aes_key: "YOUR_ENCODING_AES_KEY"
+  to_user: "@all"  # 接收通知的目标用户或部门 (@all 表示全员)
+
+server:
+  host: "0.0.0.0"
+  port: 8089
+  # 云端服务端公网地址 (本地插件或客户端上报事件用)
+  public_url: "http://your-server-domain.com"
+  api_secret: "YOUR_CUSTOM_API_SECRET"
+
+guard:
+  # 是否在推送卡片中自动附带 /collab 网页链接
+  include_collab_link: true
+  # 选项等待超时时间 (秒，默认 5 分钟)
+  ask_timeout_seconds: 300
+  # 相同异常告警防刷屏冷却时间 (秒)
+  alert_cooldown_seconds: 60
+  # 默认是否开启推送
+  default_enabled: true

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.log
+data/
+venv/
+.env
+# Protect local real config if needed (example is provided)
+config.yaml

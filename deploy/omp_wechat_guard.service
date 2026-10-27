@@ -1,0 +1,17 @@
+[Unit]
+Description=OMP WeChat Guard - Remote Alert & Interactive Control Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/omp_wechat_guard
+ExecStart=/root/mail_assist/venv/bin/python run.py --mode server
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+MemoryMax=300M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

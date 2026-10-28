@@ -365,6 +365,7 @@ function wrapUI(ui: unknown, notifyFn?: (msg: string, type?: "info" | "warning" 
 let activeInjectorCleaner: (() => void) | null = null;
 
 function startAnswerInjector(
+  totalOptions: number,
   notifyFn: (msg: string, type?: "info" | "warning" | "error") => void
 ): () => void {
   let isDone = false;
@@ -375,6 +376,33 @@ function startAnswerInjector(
       isDone = true;
       clearInterval(timer);
 
+      // 情况 A: 用户提供了自定义文本输入 (Other / 自定义内容)
+      if (ans.custom_input) {
+        notifyFn(`✍️ 收到微信自定义输入: [${ans.custom_input}]，正在选择 Other 并注入提交...`, "info");
+
+        // 1. 移动光标至 "Other (type your own)" 并按回车进入文本输入态
+        // 在 omp TUI 中，Other 位于所有预设选项之后，故需下移 totalOptions 次
+        const steps = Math.max(1, totalOptions);
+        let navSeq = "";
+        for (let i = 0; i < steps; i++) {
+          navSeq += "\x1b[B";
+        }
+        navSeq += "\r";
+
+        try {
+          process.stdin.emit("data", Buffer.from(navSeq));
+        } catch {}
+
+        // 2. 延迟 300ms 等待输入框挂载完毕，注入文本并回车提交
+        setTimeout(() => {
+          try {
+            process.stdin.emit("data", Buffer.from(`${ans.custom_input}\r`));
+          } catch {}
+        }, 300);
+        return;
+      }
+
+      // 情况 B: 用户选择了既定选项序号 (1, 2, ...)
       const choiceIdx = ans.choice_index ?? 1;
       const label = ans.choice_label || `选项 ${choiceIdx}`;
 
@@ -391,9 +419,7 @@ function startAnswerInjector(
       setTimeout(() => {
         try {
           process.stdin.emit("data", Buffer.from(seq));
-        } catch {
-          // 容错
-        }
+        } catch {}
       }, 150);
     }
   }, 1000);
@@ -431,8 +457,6 @@ export default function (pi: ExtensionAPI) {
         activeInjectorCleaner = null;
       }
       fetchPendingAnswer().catch(() => {});
-      activeInjectorCleaner = startAnswerInjector(ctx.ui.notify.bind(ctx.ui));
-
       let questions: unknown[] = [];
       if (event.input && typeof event.input === "object" && "questions" in event.input) {
         const candidate = event.input.questions;
@@ -440,6 +464,16 @@ export default function (pi: ExtensionAPI) {
           questions = candidate;
         }
       }
+
+      let totalOptions = 2;
+      const firstQ = questions[0];
+      if (firstQ && typeof firstQ === "object" && "options" in firstQ) {
+        const optsCandidate = firstQ.options;
+        if (Array.isArray(optsCandidate)) {
+          totalOptions = optsCandidate.length;
+        }
+      }
+      activeInjectorCleaner = startAnswerInjector(totalOptions, ctx.ui.notify.bind(ctx.ui));
 
       const collabUrl = getActiveCollabUrl();
       const sessionName = ctx.cwd ? path.basename(ctx.cwd) : "omp 会话";

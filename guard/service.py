@@ -240,7 +240,7 @@ class GuardService:
         return reply
 
     def _handle_option_selection(self, input_text: str, from_user: str) -> str:
-        """将用户回复解析为选项回答."""
+        """将用户回复解析为选项回答或自定义输入."""
         if not self.pending_question:
             reply = f"ℹ️ 收到输入: `{input_text}`，但当前没有等待确认的选项。\n发送 `/status` 查看最新状态，或 `/help` 查看指令。"
             self.client.send_markdown(reply, to_user=from_user)
@@ -249,17 +249,31 @@ class GuardService:
         q = self.pending_question
         options = q.get("options", [])
         matched_option = None
+        other_index = len(options) + 1
 
-        # 尝试匹配数字序号 (如 "1", "2")
+        # 1. 尝试匹配数字序号 (如 "1", "2")
         if input_text.isdigit():
             idx = int(input_text)
+            if idx == other_index:
+                reply = f"✍️ 您选择了 **{other_index}. Other (自定义输入)**。\n请直接回复您的自定义内容（例如: `使用测试配置 --dry-run`）！"
+                self.client.send_markdown(reply, to_user=from_user)
+                return reply
+
             for opt in options:
                 if opt.get("index") == idx:
                     matched_option = opt
                     break
 
-        # 尝试文本模糊匹配
+        # 2. 检查前缀指令 (例如 "3 我的配置" 或 "other 我的配置")
+        custom_content = None
         if not matched_option:
+            prefix_pattern = rf"^(?:{other_index}|other|其它|其他)\s+(.+)$"
+            m = re.match(prefix_pattern, input_text, re.IGNORECASE)
+            if m:
+                custom_content = m.group(1).strip()
+
+        # 3. 尝试文本模糊匹配已有选项标签
+        if not matched_option and not custom_content:
             norm_input = input_text.strip().lower()
             for opt in options:
                 label = str(opt.get("label", "")).strip().lower()
@@ -278,7 +292,6 @@ class GuardService:
                 "answered_at": time.time(),
                 "from_user": from_user
             }
-            # 清除待选状态
             self.pending_question = None
 
             reply = f"✅ **已确认选择**: 【选项 {choice_idx}: {choice_label}】\n已回传给 omp 驱动后续流程！"
@@ -294,23 +307,24 @@ class GuardService:
             )
             return reply
         else:
-            # 允许用户作为自定义输入提交
+            # 4. 作为自定义输入 (Other) 提交
+            final_custom = custom_content or input_text
             self.pending_answer = {
                 "question_id": q.get("id"),
-                "choice_index": None,
-                "choice_label": None,
-                "custom_input": input_text,
+                "choice_index": other_index,
+                "choice_label": "Other (type your own)",
+                "custom_input": final_custom,
                 "answered_at": time.time(),
                 "from_user": from_user
             }
             self.pending_question = None
 
-            reply = f"✍️ **已将您的自定义输入回传给 omp**:\n`{input_text}`\n正在继续执行..."
-            logger.info(f"[Service] 提交自定义输入: {input_text}")
+            reply = f"✍️ **已确认自定义输入**: 【{final_custom}】\n已自动选择 Other 注入终端提交，正在继续执行..."
+            logger.info(f"[Service] 提交自定义输入: {final_custom}")
             self.client.send_dual_notification(
                 title="✍️ 自定义输入已提交",
                 summary="自定义输入已回传",
-                details=f"<b>内容</b>: {input_text[:100]}<br/>已回传给 omp 驱动后续流程！",
+                details=f"<b>内容</b>: {final_custom[:100]}<br/>已回传至终端提交，正在继续执行...",
                 markdown_content=reply,
                 url=self.session_info.get("collab_url") or "https://work.weixin.qq.com",
                 btntxt="查看控制台",
@@ -379,9 +393,11 @@ class GuardService:
             rec = " ⭐️ *(Recommended)*" if opt.get("recommended") else ""
             desc = f" - _{opt['description']}_" if opt.get("description") else ""
             lines.append(f"  **{opt['index']}. {opt['label']}**{rec}{desc}")
+        other_idx = len(formatted_options) + 1
+        lines.append(f"  **{other_idx}. Other (自定义输入)** - _直接回复自定义文本或回复 {other_idx} <内容>_")
 
         lines.append("\n━━━━━━━━━━━━━━━━━━")
-        lines.append("👉 **方式一 (最便捷)**: 直接在微信中回复数字序号 (如 `1`)")
+        lines.append("👉 **方式一 (最便捷)**: 直接回复数字序号 (如 `1`)，或直接回复自定义内容")
         if collab_url:
             lines.append(f"👉 **方式二**: **[📱 打开手机端 Collab 控制台实时操作]({collab_url})**")
 
@@ -393,7 +409,9 @@ class GuardService:
         for opt in formatted_options:
             rec_mark = " (Recommended)" if opt.get("recommended") else ""
             card_details_lines.append(f"{opt['index']}. {opt['label']}{rec_mark}")
-        card_details_lines.append("<div class=\"highlight\">👉 微信回复数字选择，或点击卡片打开控制台</div>")
+        other_idx = len(formatted_options) + 1
+        card_details_lines.append(f"{other_idx}. Other (直接回复自定义文本)")
+        card_details_lines.append("<div class=\"highlight\">👉 回复数字选择或直接输入内容</div>")
         card_details = "<br/>".join(card_details_lines)
 
         return self.client.send_dual_notification(

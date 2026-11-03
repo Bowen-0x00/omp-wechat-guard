@@ -5,11 +5,16 @@ import time
 from urllib.parse import urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from pathlib import Path
 from typing import Optional
 from loguru import logger
 
 from .config import AppConfig
 from .service import GuardService
+
+
+# 扩展源码随服务端一同部署，供各主机一行命令下载/更新 (开源文件，不含密钥，无需鉴权)
+EXTENSION_FILE = Path(__file__).resolve().parent.parent / "extension" / "omp-wechat-guard.ts"
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -77,6 +82,19 @@ class GuardHTTPRequestHandler(BaseHTTPRequestHandler):
 
             ans = self.server_service.pop_pending_answer()
             self._send_json(200, {"code": 0, "answer": ans})
+            return
+
+        # 4. 扩展源码下载 (各主机安装/更新: curl .../extension -o ~/.omp/agent/extensions/omp-wechat-guard.ts)
+        if parsed.path in ("/api/extension", "/extension", "/api/guard/extension"):
+            if not EXTENSION_FILE.is_file():
+                self._send_json(404, {"code": 404, "error": "Extension file not deployed"})
+                return
+            body = EXTENSION_FILE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         self._send_json(404, {"code": 404, "error": "Not Found"})

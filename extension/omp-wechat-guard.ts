@@ -7,7 +7,7 @@
  * 3. 监听会话停止：上游 API 报错停止时发送预警卡片；最终输出命中自定义关键词/正则 (如 "请回复") 时推送回复提醒，
  *    微信直接回复文字即作为新消息发送给 omp。
  * 4. 多端多主机统一接入：自动识别所在主机标签 (如 Redhat、Windows、Mac) 并上报。
- * 5. 注册 /wechat 斜杠命令，随时检查连接、测试推送或管理关键词规则。
+ * 5. 注册 /wechat 斜杠命令，随时检查连接、测试推送、管理关键词规则或自更新 (/wechat update)。
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -15,6 +15,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as cp from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const GITHUB_RAW_URL = "https://raw.githubusercontent.com/Bowen-0x00/omp-wechat-guard/main/extension/omp-wechat-guard.ts";
 
 interface GuardConfig {
   tag?: string;
@@ -680,7 +683,7 @@ export default function (pi: ExtensionAPI) {
 
   // 5. 注册 /wechat 斜杠命令
   pi.registerCommand("wechat", {
-    description: "企业微信远程助手: test 发送测试卡片 | patterns 管理输出关键词规则",
+    description: "企业微信远程助手: test 发送测试卡片 | patterns 管理输出关键词规则 | update 更新扩展",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       const subcmd = trimmed.split(/\s+/)[0].toLowerCase();
@@ -734,6 +737,46 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
+      if (subcmd === "update") {
+        // 优先从网关下载 (各主机必然能访问)，失败再回退 GitHub
+        const sources = [`${config.url}/extension`, GITHUB_RAW_URL];
+        let latest = "";
+        let from = "";
+        for (const src of sources) {
+          try {
+            const resp = await fetch(src, { signal: AbortSignal.timeout(10000) });
+            const text = resp.ok ? await resp.text() : "";
+            if (text.includes('pi.registerCommand("wechat"')) {
+              latest = text;
+              from = src;
+              break;
+            }
+          } catch {
+            // 尝试下一个来源
+          }
+        }
+        if (!latest) {
+          ctx.ui.notify(`❌ 下载扩展失败，已尝试: ${sources.join(" , ")}`, "error");
+          return;
+        }
+
+        let target = path.join(os.homedir(), ".omp", "agent", "extensions", "omp-wechat-guard.ts");
+        try {
+          const self = fileURLToPath(import.meta.url);
+          if (fs.existsSync(self)) target = self;
+        } catch {
+          // 非文件加载时使用默认安装路径
+        }
+        const current = fs.existsSync(target) ? fs.readFileSync(target, "utf-8") : "";
+        if (current === latest) {
+          ctx.ui.notify(`✅ 扩展已是最新 (${target})`, "info");
+          return;
+        }
+        fs.writeFileSync(`${target}.tmp`, latest, "utf-8");
+        fs.renameSync(`${target}.tmp`, target);
+        ctx.ui.notify(`✅ 扩展已更新: ${target}\n来源: ${from}\n请重启 omp 会话使新版本生效。`, "info");
+        return;
+      }
       if (subcmd === "test") {
         ctx.ui.notify(`正在从 [${config.tag}] 发送测试卡片至微信...`, "info");
         const ok = await postEvent("ask", {
@@ -756,7 +799,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`❌ 连接网关 ${config.url} 失败，请检查网络或网关服务。`, "error");
         }
       } else {
-        ctx.ui.notify("用法: /wechat test (发送测试卡片) | /wechat patterns (管理输出关键词规则)", "info");
+        ctx.ui.notify("用法: /wechat test (发送测试卡片) | /wechat patterns (管理输出关键词规则) | /wechat update (更新扩展)", "info");
       }
     }
   });

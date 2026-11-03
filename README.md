@@ -205,13 +205,14 @@ sudo systemctl enable --now omp_wechat_guard
 
 ### 2. 在各主机安装 omp 扩展插件
 
-无论是在本地电脑还是远程服务器上，只需将扩展插件复制到 `~/.omp/agent/extensions/` 即可即插即用：
+各主机**不需要克隆本仓库**：守护服务会对外提供扩展源码 `GET <网关>/extension`，下载到 `~/.omp/agent/extensions/` 即可即插即用。
 
 #### 方案 A：Linux / macOS 服务器（如 Redhat、Ubuntu）
 ```bash
-# 1. 复制扩展文件
+# 1. 从网关下载扩展 (网关不可用时可换成 GitHub:
+#    https://raw.githubusercontent.com/Bowen-0x00/omp-wechat-guard/main/extension/omp-wechat-guard.ts)
 mkdir -p ~/.omp/agent/extensions
-cp extension/omp-wechat-guard.ts ~/.omp/agent/extensions/
+curl -fsSL http://your-server-domain.com/api/guard/extension -o ~/.omp/agent/extensions/omp-wechat-guard.ts
 
 # 2. (可选) 自定义该主机的微信显示标签，创建 ~/.omp/agent/wechat-guard.json：
 cat << 'EOF' > ~/.omp/agent/wechat-guard.json
@@ -224,11 +225,12 @@ EOF
 ```
 
 #### 方案 B：Windows 本地电脑
-直接在 `extension` 目录下双击运行：
-```text
-extension\install_extension.bat
+在 PowerShell 中执行：
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.omp\agent\extensions" | Out-Null
+Invoke-WebRequest http://your-server-domain.com/api/guard/extension -OutFile "$env:USERPROFILE\.omp\agent\extensions\omp-wechat-guard.ts"
 ```
-或手动将 `extension/omp-wechat-guard.ts` 复制至 `%USERPROFILE%\.omp\agent\extensions\`。
+已克隆仓库的话，也可以双击 `extension\install_extension.bat`。
 
 ### 3. 自定义输出关键词提醒（reply_patterns）
 
@@ -260,19 +262,20 @@ extension\install_extension.bat
 
 ### 4. 更新到新版本
 
-新功能需要**云端守护服务**和**各主机扩展**一起更新（新事件类型 `reply` / `resolved` 需要新版服务端）：
+**先更新云端守护服务，再更新各主机扩展**（新版扩展依赖新版服务端的事件类型，扩展下载地址也由服务端提供）。
 
 ```bash
 # 云端守护服务 (在服务器上)
 cd omp-wechat-guard && git pull
 sudo systemctl restart omp_wechat_guard
-
-# 每台运行 omp 的远程主机 (Linux / macOS)
-cd omp-wechat-guard && git pull
-bash extension/install_extension.sh   # 只覆盖扩展文件，已有 wechat-guard.json 不会被改动
 ```
 
-Windows 主机执行 `git pull` 后双击 `extension\install_extension.bat`。扩展在 omp 会话启动时加载，更新后需**重启正在运行的 omp 会话**。会话停止检测基于 omp 的 `session_stop` 钩子，omp 版本过旧时请先升级 omp。
+各主机更新扩展（不需要本仓库，`wechat-guard.json` 不会被改动）：
+
+- **已装有支持 `/wechat update` 的扩展**：在任一 omp 会话里执行 `/wechat update`。它会先从网关下载，失败再回退到 GitHub，然后覆盖当前加载的扩展文件。
+- **旧版扩展（还没有 `/wechat update`）或首次安装**：用上面「安装」里的 `curl` / `Invoke-WebRequest` 命令重新下载一次即可。
+
+扩展在 omp 会话启动时加载，更新后需**重启正在运行的 omp 会话**。会话停止检测基于 omp 的 `session_stop` 钩子，omp 版本过旧时请先升级 omp。
 
 ---
 

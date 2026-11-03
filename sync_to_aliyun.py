@@ -13,6 +13,7 @@ REMOTE_DIR = os.environ.get("ALIYUN_DIR", "/root/omp_wechat_guard")
 
 INCLUDE_ITEMS = [
     "guard",
+    "extension",
     "deploy",
     "requirements.txt",
     "run.py",

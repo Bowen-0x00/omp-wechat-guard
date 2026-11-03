@@ -205,13 +205,14 @@ sudo systemctl enable --now omp_wechat_guard
 
 ### 2. Install omp Extension on Worker Nodes
 
-Copy the extension file into `~/.omp/agent/extensions/` on any machine where you run `omp`:
+Hosts **do not need a clone of this repo**: the guard service serves the extension source at `GET <gateway>/extension`; download it into `~/.omp/agent/extensions/`.
 
 #### Option A: Linux / macOS Server (e.g. Redhat, Ubuntu)
 ```bash
-# 1. Copy the extension file
+# 1. Download the extension from the gateway (or from GitHub:
+#    https://raw.githubusercontent.com/Bowen-0x00/omp-wechat-guard/main/extension/omp-wechat-guard.ts)
 mkdir -p ~/.omp/agent/extensions
-cp extension/omp-wechat-guard.ts ~/.omp/agent/extensions/
+curl -fsSL http://your-server-domain.com/api/guard/extension -o ~/.omp/agent/extensions/omp-wechat-guard.ts
 
 # 2. (Optional) Customize the host label in ~/.omp/agent/wechat-guard.json:
 cat << 'EOF' > ~/.omp/agent/wechat-guard.json
@@ -224,11 +225,12 @@ EOF
 ```
 
 #### Option B: Windows Local Workstation
-Run the batch script:
-```text
-extension\install_extension.bat
+In PowerShell:
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.omp\agent\extensions" | Out-Null
+Invoke-WebRequest http://your-server-domain.com/api/guard/extension -OutFile "$env:USERPROFILE\.omp\agent\extensions\omp-wechat-guard.ts"
 ```
-Or manually copy `extension/omp-wechat-guard.ts` into `%USERPROFILE%\.omp\agent\extensions\`.
+With a repo clone you can also run `extension\install_extension.bat`.
 
 ### 3. Custom Output Keyword Alerts (reply_patterns)
 
@@ -260,19 +262,20 @@ Manage rules from inside an omp session:
 
 ### 4. Updating
 
-This feature needs **both the cloud guard service and every host extension** updated (new `reply` / `resolved` event types require the new server):
+**Update the cloud guard service first, then the host extensions** (new extensions rely on new server event types, and the server serves the extension download).
 
 ```bash
 # Cloud guard service (on the server)
 cd omp-wechat-guard && git pull
 sudo systemctl restart omp_wechat_guard
-
-# Every remote host running omp (Linux / macOS)
-cd omp-wechat-guard && git pull
-bash extension/install_extension.sh   # only overwrites the extension; existing wechat-guard.json is kept
 ```
 
-On Windows hosts run `git pull`, then `extension\install_extension.bat`. Extensions load at session start, so **restart running omp sessions** after updating. Stop detection uses omp's `session_stop` hook; upgrade omp first if it is too old.
+Updating host extensions (no repo needed; `wechat-guard.json` is kept):
+
+- **Extension already supports `/wechat update`**: run `/wechat update` in any omp session. It downloads from the gateway (falling back to GitHub) and overwrites the loaded extension file.
+- **Older extension without `/wechat update`, or first install**: re-run the `curl` / `Invoke-WebRequest` command from the install section once.
+
+Extensions load at session start, so **restart running omp sessions** after updating. Stop detection uses omp's `session_stop` hook; upgrade omp first if it is too old.
 
 ---
 

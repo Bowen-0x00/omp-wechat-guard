@@ -172,7 +172,10 @@ class GuardService:
             for opt in q.get("options", []):
                 rec = " *(Recommended)*" if opt.get("recommended") else ""
                 lines.append(f"  **{opt.get('index')}**. {opt.get('label')}{rec}")
-            lines.append("\n👉 **直接在微信回复序号 (如 `1`) 即可选择！**")
+            if q.get("kind") == "reply":
+                lines.append("\n👉 **直接在微信回复文字即可发送给 omp！**")
+            else:
+                lines.append("\n👉 **直接在微信回复序号 (如 `1`) 即可选择！**")
 
         if collab_url:
             lines.append(f"\n📱 **[点击打开手机端 Collab 网页控制台]({collab_url})**")
@@ -247,6 +250,9 @@ class GuardService:
             return reply
 
         q = self.pending_question
+        if q.get("kind") == "reply":
+            return self._submit_free_reply(q, input_text, from_user)
+
         options = q.get("options", [])
         matched_option = None
         other_index = len(options) + 1
@@ -331,6 +337,32 @@ class GuardService:
                 to_user=from_user
             )
             return reply
+
+    def _submit_free_reply(self, q: Dict[str, Any], text: str, from_user: str) -> str:
+        """将微信回复作为新的用户消息回传 (用于会话停止后等待回复的场景)."""
+        self.pending_answer = {
+            "question_id": q.get("id"),
+            "choice_index": None,
+            "choice_label": None,
+            "custom_input": text,
+            "answered_at": time.time(),
+            "from_user": from_user
+        }
+        self.pending_question = None
+        self.session_info["input_required"] = False
+
+        reply = f"💬 **已发送回复**: 【{text}】\n已作为新消息发送给 omp，正在继续执行..."
+        logger.info(f"[Service] 提交会话回复: {text}")
+        self.client.send_dual_notification(
+            title="💬 回复已发送",
+            summary="回复已回传 omp",
+            details=f"<b>内容</b>: {text[:100]}<br/>已作为新消息发送给 omp，正在继续执行...",
+            markdown_content=reply,
+            url=q.get("collab_url") or self.session_info.get("collab_url") or "https://work.weixin.qq.com",
+            btntxt="查看控制台",
+            to_user=from_user
+        )
+        return reply
 
     # -------------------------------------------------------------------------
     # 外部事件接入 (来自本地 omp 扩展或监控器)
@@ -476,6 +508,75 @@ class GuardService:
             url=collab_url or "https://work.weixin.qq.com",
             btntxt="立即排查" if collab_url else "查看详情"
         )
+
+    def on_reply_event(self, data: Dict[str, Any]) -> bool:
+        """处理会话停止且输出命中自定义关键词 (等待用户回复) 的事件."""
+        if not self.is_notifications_active():
+            logger.info("[Service] 通知当前处于关闭或免打扰中，跳过推送回复提醒")
+            return False
+
+        q_id = str(data.get("id", f"r_{int(time.time())}"))
+        session_name = data.get("session_name") or self.session_info.get("session_name", "omp 会话")
+        matched = str(data.get("matched", ""))
+        excerpt = str(data.get("excerpt", "")).strip()
+        collab_url = data.get("collab_url") or self.session_info.get("collab_url", "")
+
+        self.pending_question = {
+            "id": q_id,
+            "kind": "reply",
+            "session_name": session_name,
+            "question": f"会话停止等待回复 (命中: {matched})",
+            "options": [],
+            "collab_url": collab_url,
+            "created_at": time.time()
+        }
+        self.session_info["input_required"] = True
+
+        host_name = data.get("host_name", "")
+        platform_name = data.get("platform", "")
+        title = f"💬 [{host_name}] omp 等待您的回复" if host_name else "💬 omp 等待您的回复"
+
+        lines = [
+            f"### {title}",
+            f"• **来源主机**: `{host_name}` ({platform_name})" if host_name else "",
+            f"• **会话**: {session_name}",
+            f"• **命中规则**: `{matched}`",
+        ]
+        if excerpt:
+            quoted = "\n".join(f"> {line}" for line in excerpt.splitlines() if line.strip())
+            lines.append(f"\n**输出末尾**:\n{quoted}")
+        lines.append("\n━━━━━━━━━━━━━━━━━━")
+        lines.append("👉 **直接回复文字**，即作为新消息发送给 omp")
+        if collab_url:
+            lines.append(f"👉 **[📱 打开手机端 Collab 控制台]({collab_url})**")
+        content = "\n".join(line for line in lines if line)
+
+        card_excerpt = excerpt[-200:].replace("\n", "<br/>")
+        card_details = f"<b>命中</b>: {matched}<br/>"
+        if card_excerpt:
+            card_details += f"<div class=\"gray\">{card_excerpt}</div>"
+        card_details += "<div class=\"highlight\">👉 直接回复文字即发送给 omp</div>"
+
+        return self.client.send_dual_notification(
+            title=title,
+            summary=f"会话: {session_name} | 等待回复",
+            details=card_details,
+            markdown_content=content,
+            url=collab_url or "https://work.weixin.qq.com",
+            btntxt="打开控制台" if collab_url else "查看详情"
+        )
+
+    def resolve_pending(self, question_id: str) -> bool:
+        """本地已处理 (用户在终端直接继续) 时清除对应的待办问题与未消费答复."""
+        cleared = False
+        if self.pending_question and str(self.pending_question.get("id")) == question_id:
+            self.pending_question = None
+            self.session_info["input_required"] = False
+            cleared = True
+        if self.pending_answer and str(self.pending_answer.get("question_id")) == question_id:
+            self.pending_answer = None
+            cleared = True
+        return cleared
 
     def update_session_status(self, data: Dict[str, Any]) -> None:
         """更新本地会话状态缓存."""

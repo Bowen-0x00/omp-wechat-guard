@@ -24,6 +24,8 @@ Whether your `omp` runs on a **local Windows workstation**, a **remote Redhat/Li
   - Notification cards embed end-to-end encrypted Collab deep links. Tap to open the mobile browser console and interact live on your phone.
 - ⚠️ **Unexpected Stop & Upstream API Error Alerts**:
   - Detects upstream LLM API errors (503 Service Unavailable, 429 Rate Limit, timeouts) and connection drops in real-time, with built-in 60s cooldown flood protection.
+- 💬 **Custom Output Keyword Alerts (agent stopped, waiting for your reply)**:
+  - When a session finally stops and its last output matches one of your keywords or regexes (e.g. `请回复`, `/please (just )?reply/i`), a "waiting for your reply" card is pushed. Reply with any text in WeChat and it is sent to omp as a new message.
 - 🌐 **Automatic Multi-Host Identification (Host Tag)**:
   - Automatically identifies where the session originates (e.g. `[Redhat Server]`, `[Local Windows Workstation]`, `[MacBook]`), clearly displaying the hostname and working directory.
 - 🎛️ **Full Remote Control Commands**:
@@ -227,6 +229,50 @@ Run the batch script:
 extension\install_extension.bat
 ```
 Or manually copy `extension/omp-wechat-guard.ts` into `%USERPROFILE%\.omp\agent\extensions\`.
+
+### 3. Custom Output Keyword Alerts (reply_patterns)
+
+Some agents stop and ask you to **reply directly** instead of showing options. Add `reply_patterns` to `~/.omp/agent/wechat-guard.json` on each host; when a session stops and its last output matches any rule, a reminder is pushed:
+
+```json
+{
+  "tag": "Redhat Server",
+  "url": "http://your-server-domain.com/api/guard",
+  "secret": "your_api_secret_token",
+  "reply_patterns": ["please reply", "/please (just )?reply/i", "/^awaiting .*confirmation$/m"]
+}
+```
+
+- **Plain string**: case-insensitive substring match.
+- **`/regex/flags`**: JavaScript regex match.
+- Only the visible text of the last assistant message is checked (no thinking); error stops and manual aborts never trigger it.
+- The config is re-read on every stop, so **edits apply immediately without restarting omp**.
+- Reply with any text (digits included) in WeChat to send it to omp as a new message; if you continue in the terminal first, the reminder is discarded.
+
+Manage rules from inside an omp session:
+
+| Command | Description |
+| :--- | :--- |
+| `/wechat patterns` | List rules |
+| `/wechat patterns add please reply` | Add a rule (regex: `/wechat patterns add /please (just )?reply/i`) |
+| `/wechat patterns rm 2` | Remove by index or exact text |
+| `/wechat patterns test Option A or B? Please reply` | Check whether text matches |
+
+### 4. Updating
+
+This feature needs **both the cloud guard service and every host extension** updated (new `reply` / `resolved` event types require the new server):
+
+```bash
+# Cloud guard service (on the server)
+cd omp-wechat-guard && git pull
+sudo systemctl restart omp_wechat_guard
+
+# Every remote host running omp (Linux / macOS)
+cd omp-wechat-guard && git pull
+bash extension/install_extension.sh   # only overwrites the extension; existing wechat-guard.json is kept
+```
+
+On Windows hosts run `git pull`, then `extension\install_extension.bat`. Extensions load at session start, so **restart running omp sessions** after updating. Stop detection uses omp's `session_stop` hook; upgrade omp first if it is too old.
 
 ---
 

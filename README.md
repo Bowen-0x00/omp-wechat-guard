@@ -24,6 +24,8 @@
   - 推送卡片内置当前会话的端到端加密 Collab 网页直链，点击即可在手机浏览器中实时查看流式输出并直接点选操作。
 - ⚠️ **任务异常停止与上游报错预警**：
   - 实时捕获大模型上游 API 报错（503 服务不可用、429 超额、请求超时等）及网络中断故障，附带 60 秒防刷屏冷却保护。
+- 💬 **自定义输出关键词提醒（Agent 停下来等你回复）**：
+  - 会话最终停止时，若最后一条输出命中你配置的关键词或正则（如 `请回复`、`/请(直接)?回复/`），立即推送「等待您的回复」卡片；在微信直接回复文字即作为新消息发送给 omp 继续对话。
 - 🌐 **多主机节点自动标识（Multi-Host Tag）**：
   - 自动识别当前会话来源节点（如 `[Redhat 服务器]`、`[本地 Windows 工作站]`、`[MacBook]`），卡片清晰标明机器身份与工作路径。
 - 🎛️ **全套微信远程指令控制**：
@@ -227,6 +229,50 @@ EOF
 extension\install_extension.bat
 ```
 或手动将 `extension/omp-wechat-guard.ts` 复制至 `%USERPROFILE%\.omp\agent\extensions\`。
+
+### 3. 自定义输出关键词提醒（reply_patterns）
+
+有的 Agent 停下来是让你**直接回复**而不是弹出选项。在各主机的 `~/.omp/agent/wechat-guard.json` 中加入 `reply_patterns`，会话停止时最后一条输出命中任意一条规则就推送提醒：
+
+```json
+{
+  "tag": "本地 Windows 工作站",
+  "url": "http://your-server-domain.com/api/guard",
+  "secret": "your_api_secret_token",
+  "reply_patterns": ["请回复", "请直接回复", "/请(直接|尽快)?回复/", "/^等待.*确认$/m"]
+}
+```
+
+- **普通字符串**：包含即命中（忽略大小写）。
+- **`/正则/标志`**：按 JavaScript 正则匹配，如 `/请(直接)?回复/`、`/done$/im`。
+- 只检查最后一条回复的正文（不含思考过程）；报错停止和手动中断不触发。
+- 每次停止时重新读取配置，**修改后立即生效，无需重启 omp**。
+- 收到卡片后在微信直接回复文字（包括纯数字）即作为新消息发给 omp；如果你已经在终端里继续输入，该提醒自动作废。
+
+也可以在 omp 会话里直接管理，不用手改 JSON：
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `/wechat patterns` | 列出当前规则 |
+| `/wechat patterns add 请直接回复` | 添加规则（正则: `/wechat patterns add /请(直接)?回复/`） |
+| `/wechat patterns rm 2` | 按序号或原文删除规则 |
+| `/wechat patterns test 方案A还是B？请直接回复` | 测试一段文字是否命中 |
+
+### 4. 更新到新版本
+
+新功能需要**云端守护服务**和**各主机扩展**一起更新（新事件类型 `reply` / `resolved` 需要新版服务端）：
+
+```bash
+# 云端守护服务 (在服务器上)
+cd omp-wechat-guard && git pull
+sudo systemctl restart omp_wechat_guard
+
+# 每台运行 omp 的远程主机 (Linux / macOS)
+cd omp-wechat-guard && git pull
+bash extension/install_extension.sh   # 只覆盖扩展文件，已有 wechat-guard.json 不会被改动
+```
+
+Windows 主机执行 `git pull` 后双击 `extension\install_extension.bat`。扩展在 omp 会话启动时加载，更新后需**重启正在运行的 omp 会话**。会话停止检测基于 omp 的 `session_stop` 钩子，omp 版本过旧时请先升级 omp。
 
 ---
 

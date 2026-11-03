@@ -4,9 +4,10 @@
  * 功能:
  * 1. 拦截 ask 工具调用：提取问题与选项，附带 Collab 网页控制台链接，实时推送到微信。
  * 2. 微信远程应答自动注入：用户在微信对话框回复数字序号或内容时，自动解决待办选项，驱动 omp 继续执行！
- * 3. 监听任务异常与中断：当上游 API 报错或网络不可达导致 agent 异常停止时，发送预警卡片。
+ * 3. 监听会话停止：上游 API 报错停止时发送预警卡片；最终输出命中自定义关键词/正则 (如 "请回复") 时推送回复提醒，
+ *    微信直接回复文字即作为新消息发送给 omp。
  * 4. 多端多主机统一接入：自动识别所在主机标签 (如 Redhat、Windows、Mac) 并上报。
- * 5. 注册 /wechat 斜杠命令，随时检查连接或测试推送。
+ * 5. 注册 /wechat 斜杠命令，随时检查连接、测试推送或管理关键词规则。
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -19,6 +20,7 @@ interface GuardConfig {
   tag?: string;
   url?: string;
   secret?: string;
+  reply_patterns?: string[];
 }
 
 interface PendingAnswer {
@@ -69,18 +71,22 @@ interface WrappedUIContext {
   notify: (message: string, type?: "info" | "warning" | "error") => void;
 }
 
-function loadGuardConfig(): { tag: string; url: string; secret: string } {
-  const home = os.homedir();
-  const cfgPath = path.join(home, ".omp", "agent", "wechat-guard.json");
-  let cfg: GuardConfig = {};
-  if (fs.existsSync(cfgPath)) {
-    try {
-      cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8")) as GuardConfig;
-    } catch {
-      // 忽略配置文件读取异常
-    }
-  }
+const CONFIG_PATH = path.join(os.homedir(), ".omp", "agent", "wechat-guard.json");
 
+function readConfigFile(): GuardConfig {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      const parsed: unknown = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+      if (parsed && typeof parsed === "object") return parsed as GuardConfig;
+    }
+  } catch {
+    // 忽略配置文件读取异常
+  }
+  return {};
+}
+
+function loadGuardConfig(): { tag: string; url: string; secret: string } {
+  const cfg = readConfigFile();
   // 友好主机名
   let defaultTag = os.hostname();
   if (defaultTag === "localhost" || defaultTag === "localhost.localdomain") {
@@ -95,6 +101,72 @@ function loadGuardConfig(): { tag: string; url: string; secret: string } {
 }
 
 const config = loadGuardConfig();
+
+// -----------------------------------------------------------------------------
+// 自定义输出关键词规则 (wechat-guard.json -> reply_patterns)
+//   普通字符串: 子串匹配 (忽略大小写)，如 "请回复"
+//   /正则/标志: 正则匹配，如 "/请(直接)?回复/"、"/^等待.*确认$/m"
+// 每次会话停止时重新读取配置文件，修改后无需重启 omp。
+// -----------------------------------------------------------------------------
+
+interface CompiledPattern {
+  source: string;
+  regex: RegExp;
+}
+
+function compilePattern(source: string): CompiledPattern {
+  const m = /^\/(.+)\/([a-z]*)$/s.exec(source);
+  if (m) {
+    // 去掉 g/y，避免 RegExp.test 的 lastIndex 状态
+    return { source, regex: new RegExp(m[1], m[2].replace(/[gy]/g, "")) };
+  }
+  return { source, regex: new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") };
+}
+
+function loadReplyPatterns(): { patterns: CompiledPattern[]; errors: string[] } {
+  const raw = readConfigFile().reply_patterns;
+  const patterns: CompiledPattern[] = [];
+  const errors: string[] = [];
+  if (!Array.isArray(raw)) return { patterns, errors };
+  for (const p of raw) {
+    if (typeof p !== "string" || !p.trim()) continue;
+    try {
+      patterns.push(compilePattern(p));
+    } catch (e) {
+      errors.push(`${p} (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+  return { patterns, errors };
+}
+
+function saveReplyPatterns(list: string[]): void {
+  let raw: Record<string, unknown> = {};
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      const parsed: unknown = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+      if (parsed && typeof parsed === "object") raw = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // 配置损坏时仅写入规则字段，避免抛错
+  }
+  raw.reply_patterns = list;
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+}
+
+function extractText(message: unknown): string {
+  if (!message || typeof message !== "object" || !("content" in message)) return "";
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let text = "";
+  for (const c of content) {
+    if (c && typeof c === "object" && "type" in c && c.type === "text" && "text" in c && typeof c.text === "string") {
+      text += c.text + "\n";
+    }
+  }
+  return text.trim();
+}
 
 function getActiveCollabUrl(): string {
   // 从 ~/.omp/run/collab-hosts 快速安全读取已发布的 Collab 信息 (纯文件读取，零死锁风险)
@@ -431,6 +503,41 @@ function startAnswerInjector(
 }
 
 export default function (pi: ExtensionAPI) {
+  // 会话停止后等待微信回复的轮询器 (每个会话独立，子代理会话不触发 session_stop)
+  let activeReplyWaiter: { id: string; stop: () => void } | null = null;
+
+  /** 停止等待微信回复；localHandled=true 表示用户已在本地继续，通知网关清除该待办。 */
+  const cancelReplyWaiter = (localHandled: boolean) => {
+    if (!activeReplyWaiter) return;
+    const { id, stop } = activeReplyWaiter;
+    activeReplyWaiter = null;
+    stop();
+    if (localHandled) void postEvent("resolved", { id });
+  };
+
+  const startReplyWaiter = (id: string, notifyFn: (msg: string, type?: "info" | "warning" | "error") => void) => {
+    cancelReplyWaiter(false);
+    let polling = false;
+    const timer = setInterval(async () => {
+      if (polling || activeReplyWaiter?.id !== id) return;
+      polling = true;
+      try {
+        const ans = await fetchPendingAnswer();
+        if (!ans || activeReplyWaiter?.id !== id) return;
+        cancelReplyWaiter(false);
+        const text = (ans.custom_input || ans.choice_label || "").trim();
+        if (!text) return;
+        notifyFn(`💬 收到微信回复: [${text}]，正在发送给 omp...`, "info");
+        pi.sendUserMessage(text);
+      } catch {
+        // 保护会话不被轮询异常中断
+      } finally {
+        polling = false;
+      }
+    }, 2000);
+    activeReplyWaiter = { id, stop: () => clearInterval(timer) };
+  };
+
   // 1. 会话启动就绪
   pi.on("session_start", async (_event, ctx) => {
     try {
@@ -498,51 +605,135 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 3. 核心监控：当 Agent 结束或异常中断时
-  pi.on("agent_end", async (event, ctx) => {
+  // 3. Agent 结束：清理选项注入器
+  pi.on("agent_end", async () => {
     if (activeInjectorCleaner) {
       activeInjectorCleaner();
       activeInjectorCleaner = null;
     }
+  });
+
+  // 用户在本地继续对话 (或微信回复已注入) 时，停止等待微信回复
+  pi.on("agent_start", async () => {
+    cancelReplyWaiter(true);
+  });
+
+  pi.on("session_shutdown", async () => {
+    cancelReplyWaiter(false);
+  });
+
+  // 4. 核心监控：主会话最终停止时 (session_stop 不会在子代理会话触发)
+  //    - 上游 API 报错停止 -> 异常告警
+  //    - 最终输出命中 reply_patterns -> 推送回复提醒，并等待微信回复注入
+  //    该钩子在会话结算前被等待，因此上报一律不 await，避免拖慢停止。
+  pi.on("session_stop", async (event, ctx) => {
     try {
-      if (!event || typeof event !== "object" || !("lastAssistantMessage" in event)) return;
-      const lastMsg = event.lastAssistantMessage;
+      const lastMsg = event && typeof event === "object" && "last_assistant_message" in event
+        ? event.last_assistant_message
+        : undefined;
       if (!lastMsg || typeof lastMsg !== "object") return;
 
       const stopReason = "stopReason" in lastMsg && typeof lastMsg.stopReason === "string" ? lastMsg.stopReason : undefined;
-      const collabUrl = getActiveCollabUrl();
+      const text = extractText(lastMsg);
       const sessionName = ctx.cwd ? path.basename(ctx.cwd) : "omp 会话";
 
-      // 判断是否因异常、网络错误或上游 API 报错停止
       if (stopReason === "error") {
-        let errDetail = "";
-        if ("content" in lastMsg && Array.isArray(lastMsg.content)) {
-          for (const c of lastMsg.content) {
-            if (c && typeof c === "object" && "type" in c && c.type === "text" && "text" in c && typeof c.text === "string") {
-              errDetail += c.text + "\n";
-            }
-          }
-        }
-
+        const errorMessage = "errorMessage" in lastMsg && typeof lastMsg.errorMessage === "string" ? lastMsg.errorMessage : "";
         ctx.ui.notify(`⚠️ [${config.tag}] 检测到任务异常停止，正在发送微信告警...`, "warning");
-        await postEvent("error", {
+        void postEvent("error", {
           session_name: sessionName,
           cwd: ctx.cwd,
           error: "上游大模型 API 报错或网络连接异常中断",
-          detail: errDetail.slice(0, 300),
-          collab_url: collabUrl
+          detail: (errorMessage || text).slice(0, 300),
+          collab_url: getActiveCollabUrl()
         });
+        return;
       }
+      if (stopReason === "aborted" || !text) return;
+
+      const { patterns, errors } = loadReplyPatterns();
+      if (errors.length > 0) {
+        ctx.ui.notify(`⚠️ wechat-guard 已跳过无效规则: ${errors.join("; ")}`, "warning");
+      }
+      const hit = patterns.find(p => p.regex.test(text));
+      if (!hit) return;
+
+      const id = `reply_${Date.now()}`;
+      startReplyWaiter(id, ctx.ui.notify.bind(ctx.ui));
+      ctx.ui.notify(`💬 [${config.tag}] 输出命中规则 ${hit.source}，正在推送回复提醒至微信...`, "info");
+      void postEvent("reply", {
+        id,
+        session_name: sessionName,
+        cwd: ctx.cwd,
+        matched: hit.source,
+        excerpt: text.slice(-500),
+        collab_url: getActiveCollabUrl()
+      }).then(ok => {
+        if (ok) {
+          ctx.ui.notify(`📱 [${config.tag}] 回复提醒已送达微信！在微信直接回复文字即可继续对话。`, "info");
+        }
+      });
     } catch {
-      // 保护 agent 循环不被扩展异常阻断
+      // 保护会话结算不被扩展异常阻断
     }
   });
 
-  // 4. 注册 /wechat 斜杠命令
+  // 5. 注册 /wechat 斜杠命令
   pi.registerCommand("wechat", {
-    description: "检查企业微信远程助手状态或发送测试卡片",
+    description: "企业微信远程助手: test 发送测试卡片 | patterns 管理输出关键词规则",
     handler: async (args, ctx) => {
-      const subcmd = args.trim().toLowerCase();
+      const trimmed = args.trim();
+      const subcmd = trimmed.split(/\s+/)[0].toLowerCase();
+      if (subcmd === "patterns") {
+        const rest = trimmed.slice(subcmd.length).trim();
+        const action = rest.split(/\s+/)[0].toLowerCase();
+        const value = rest.slice(action.length).trim();
+        const raw = readConfigFile().reply_patterns;
+        const list = Array.isArray(raw) ? raw.filter((p): p is string => typeof p === "string") : [];
+
+        if (action === "add" && value) {
+          try {
+            compilePattern(value);
+          } catch (e) {
+            ctx.ui.notify(`❌ 无效正则: ${e instanceof Error ? e.message : String(e)}`, "error");
+            return;
+          }
+          if (!list.includes(value)) {
+            list.push(value);
+            saveReplyPatterns(list);
+          }
+          ctx.ui.notify(`✅ 已添加规则: ${value} (共 ${list.length} 条，立即生效)`, "info");
+        } else if (action === "rm" && value) {
+          const idx = /^\d+$/.test(value) ? Number(value) - 1 : list.indexOf(value);
+          if (idx < 0 || idx >= list.length) {
+            ctx.ui.notify(`❌ 未找到规则: ${value}`, "error");
+            return;
+          }
+          const [removed] = list.splice(idx, 1);
+          saveReplyPatterns(list);
+          ctx.ui.notify(`🗑️ 已删除规则: ${removed}`, "info");
+        } else if (action === "test" && value) {
+          const { patterns, errors } = loadReplyPatterns();
+          const hit = patterns.find(p => p.regex.test(value));
+          const errNote = errors.length > 0 ? `\n⚠️ 无效规则: ${errors.join("; ")}` : "";
+          ctx.ui.notify(hit ? `✅ 命中规则: ${hit.source}${errNote}` : `⚪ 未命中任何规则${errNote}`, "info");
+        } else if (action === "" || action === "list") {
+          const lines = list.length > 0
+            ? list.map((p, i) => `  ${i + 1}. ${p}`).join("\n")
+            : "  (未配置)";
+          ctx.ui.notify(`📝 输出关键词规则 (${CONFIG_PATH} -> reply_patterns):\n${lines}`, "info");
+        } else {
+          ctx.ui.notify(
+            "用法:\n" +
+            "  /wechat patterns                列出规则\n" +
+            "  /wechat patterns add <规则>     添加 (普通文字=包含匹配, /正则/flags=正则)\n" +
+            "  /wechat patterns rm <序号|规则>  删除\n" +
+            "  /wechat patterns test <文本>    测试文本是否命中",
+            "info"
+          );
+        }
+        return;
+      }
       if (subcmd === "test") {
         ctx.ui.notify(`正在从 [${config.tag}] 发送测试卡片至微信...`, "info");
         const ok = await postEvent("ask", {
@@ -565,7 +756,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`❌ 连接网关 ${config.url} 失败，请检查网络或网关服务。`, "error");
         }
       } else {
-        ctx.ui.notify("用法: /wechat test (发送测试卡片)", "info");
+        ctx.ui.notify("用法: /wechat test (发送测试卡片) | /wechat patterns (管理输出关键词规则)", "info");
       }
     }
   });

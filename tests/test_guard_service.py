@@ -101,6 +101,37 @@ def test_option_selection_flow(mock_service):
     assert mock_service.pop_pending_answer() is None
 
 
+def test_reply_event_flow(mock_service):
+    # 会话停止且输出命中关键词: 任意文字回复 (包括纯数字) 都作为新消息回传
+    ok = mock_service.on_reply_event({
+        "id": "reply_1",
+        "session_name": "重构任务",
+        "matched": "/请(直接)?回复/",
+        "excerpt": "方案 A 或 B？请直接回复。"
+    })
+    assert ok is True
+    assert mock_service.pending_question["kind"] == "reply"
+
+    reply = mock_service.handle_wechat_command("2", from_user="bowen")
+    assert "已发送回复" in reply
+    ans = mock_service.pop_pending_answer()
+    assert ans["question_id"] == "reply_1"
+    assert ans["custom_input"] == "2"
+    assert mock_service.pending_question is None
+
+
+def test_resolve_pending_only_clears_matching_id(mock_service):
+    mock_service.on_reply_event({"id": "reply_2", "matched": "请回复"})
+    assert mock_service.resolve_pending("reply_other") is False
+    assert mock_service.pending_question is not None
+
+    # 用户已在本地继续: 清除待办，之后的微信回复不应被注入
+    assert mock_service.resolve_pending("reply_2") is True
+    assert mock_service.pending_question is None
+    mock_service.handle_wechat_command("继续")
+    assert mock_service.pop_pending_answer() is None
+
+
 def test_error_alert_cooldown(mock_service):
     err_data = {
         "session_id": "sess_1",

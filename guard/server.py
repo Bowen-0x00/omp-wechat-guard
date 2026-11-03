@@ -121,6 +121,12 @@ class GuardHTTPRequestHandler(BaseHTTPRequestHandler):
                 elif event_type == "error":
                     ok = self.server_service.on_error_event(event_data)
                     self._send_json(200, {"code": 0, "msg": "Error event processed", "notified": ok})
+                elif event_type == "reply":
+                    ok = self.server_service.on_reply_event(event_data)
+                    self._send_json(200, {"code": 0, "msg": "Reply event processed", "notified": ok})
+                elif event_type == "resolved":
+                    cleared = self.server_service.resolve_pending(str(event_data.get("id", "")))
+                    self._send_json(200, {"code": 0, "msg": "Pending resolved", "cleared": cleared})
                 elif event_type in ("status", "status_update"):
                     self.server_service.update_session_status(event_data)
                     self._send_json(200, {"code": 0, "msg": "Status updated"})

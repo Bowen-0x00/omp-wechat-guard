@@ -62,6 +62,7 @@ interface AskDialogResult {
 
 interface WrappedUIContext {
   __wechat_wrapped?: boolean;
+  __wechat_has_dialog?: boolean;
   select?: (
     title: string,
     options: (string | { label: string; description?: string })[],
@@ -283,14 +284,16 @@ function pollForSelect(
       localAbort.abort(); // 关闭本地正在等待的弹窗
 
       let chosen = "";
-      if (ans.choice_index !== undefined && ans.choice_index !== null) {
+      if (ans.custom_input) {
+        chosen = ans.custom_input;
+      } else if (ans.choice_index !== undefined && ans.choice_index !== null) {
         const idx = ans.choice_index - 1;
         if (idx >= 0 && idx < options.length) {
           const opt = options[idx];
           chosen = typeof opt === "string" ? opt : opt.label;
         }
       }
-      if (!chosen && ans.choice_label) {
+      if (!chosen && ans.choice_label && ans.choice_label !== "Other (type your own)") {
         chosen = ans.choice_label;
       }
       if (!chosen && ans.custom_input) {
@@ -302,7 +305,11 @@ function pollForSelect(
       }
 
       if (notifyFn) {
-        notifyFn(`✅ 已接收微信远程选择: [${chosen}]，正在继续推进...`, "info");
+        if (ans.custom_input) {
+          notifyFn(`✍️ 已接收微信远程自定义输入: [${chosen}]，正在继续推进...`, "info");
+        } else {
+          notifyFn(`✅ 已接收微信远程选择: [${chosen}]，正在继续推进...`, "info");
+        }
       }
       resolve(chosen);
     }
@@ -343,6 +350,17 @@ function pollForAskDialog(
 
       let chosenDisplay = "";
       const results: AskDialogResultItem[] = questions.map((q) => {
+        // 1. 优先使用用户输入的自定义文本 (Other / 自由输入)
+        if (ans.custom_input) {
+          chosenDisplay = ans.custom_input;
+          return {
+            id: q.id,
+            selectedOptions: [],
+            customInput: ans.custom_input
+          };
+        }
+
+        // 2. 匹配已有选项序号
         let chosenLabel = "";
         if (ans.choice_index !== undefined && ans.choice_index !== null) {
           const idx = ans.choice_index - 1;
@@ -350,7 +368,7 @@ function pollForAskDialog(
             chosenLabel = q.options[idx].label;
           }
         }
-        if (!chosenLabel && ans.choice_label) {
+        if (!chosenLabel && ans.choice_label && ans.choice_label !== "Other (type your own)") {
           chosenLabel = ans.choice_label;
         }
 
@@ -362,17 +380,21 @@ function pollForAskDialog(
             customInput: undefined
           };
         } else {
-          chosenDisplay = ans.custom_input || "自定义输入";
+          chosenDisplay = q.options.length > 0 ? q.options[0].label : "默认确认";
           return {
             id: q.id,
-            selectedOptions: [],
-            customInput: ans.custom_input || ""
+            selectedOptions: q.options.length > 0 ? [q.options[0].label] : [],
+            customInput: undefined
           };
         }
       });
 
       if (notifyFn) {
-        notifyFn(`✅ 已接收微信远程选择: [${chosenDisplay}]，正在继续推进...`, "info");
+        if (ans.custom_input) {
+          notifyFn(`✍️ 已接收微信远程自定义输入: [${chosenDisplay}]，正在继续推进...`, "info");
+        } else {
+          notifyFn(`✅ 已接收微信远程选择: [${chosenDisplay}]，正在继续推进...`, "info");
+        }
       }
       resolve({ results });
     }
@@ -382,16 +404,18 @@ function pollForAskDialog(
   return promise;
 }
 
-function wrapUI(ui: unknown, notifyFn?: (msg: string, type?: "info" | "warning" | "error") => void) {
-  if (!ui || typeof ui !== "object") return;
+function wrapUI(ui: unknown, notifyFn?: (msg: string, type?: "info" | "warning" | "error") => void): boolean {
+  if (!ui || typeof ui !== "object") return false;
   const wrapped = ui as WrappedUIContext;
-  if (wrapped.__wechat_wrapped) return;
+  if (wrapped.__wechat_wrapped) return Boolean(wrapped.__wechat_has_dialog);
   wrapped.__wechat_wrapped = true;
+  let hasDialog = false;
   if (notifyFn) {
     notifyFn(`[DEBUG] wrapUI: select=${typeof wrapped.select}, askDialog=${typeof wrapped.askDialog}`, "info");
   }
   // 1. 拦截富文本 askDialog
   if (typeof wrapped.askDialog === "function") {
+    hasDialog = true;
     const origAskDialog = wrapped.askDialog.bind(wrapped);
     wrapped.askDialog = async (questions, opts) => {
       const localAbort = new AbortController();
@@ -413,8 +437,8 @@ function wrapUI(ui: unknown, notifyFn?: (msg: string, type?: "info" | "warning" 
     };
   }
 
-  // 2. 拦截选择器 select
   if (typeof wrapped.select === "function") {
+    hasDialog = true;
     const origSelect = wrapped.select.bind(wrapped);
     wrapped.select = async (title, options, opts) => {
       const localAbort = new AbortController();
@@ -435,6 +459,9 @@ function wrapUI(ui: unknown, notifyFn?: (msg: string, type?: "info" | "warning" 
       return await Promise.race([localPromise, wechatPromise]);
     };
   }
+
+  wrapped.__wechat_has_dialog = hasDialog;
+  return hasDialog;
 }
 
 let activeInjectorCleaner: (() => void) | null = null;
@@ -561,7 +588,7 @@ export default function (pi: ExtensionAPI) {
   // 2. 核心拦截：当 Agent 准备弹出 ask 选项时
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName === "ask") {
-      wrapUI(ctx.ui, ctx.ui.notify.bind(ctx.ui));
+      const isIntercepted = wrapUI(ctx.ui, ctx.ui.notify.bind(ctx.ui));
       if (activeInjectorCleaner) {
         activeInjectorCleaner();
         activeInjectorCleaner = null;
@@ -575,15 +602,18 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      let totalOptions = 2;
-      const firstQ = questions[0];
-      if (firstQ && typeof firstQ === "object" && "options" in firstQ) {
-        const optsCandidate = firstQ.options;
-        if (Array.isArray(optsCandidate)) {
-          totalOptions = optsCandidate.length;
+      // 仅当 UI 无法通过 API 拦截时，才启用底层终端按键模拟作为备用兜底
+      if (!isIntercepted) {
+        let totalOptions = 2;
+        const firstQ = questions[0];
+        if (firstQ && typeof firstQ === "object" && "options" in firstQ) {
+          const optsCandidate = firstQ.options;
+          if (Array.isArray(optsCandidate)) {
+            totalOptions = optsCandidate.length;
+          }
         }
+        activeInjectorCleaner = startAnswerInjector(totalOptions, ctx.ui.notify.bind(ctx.ui));
       }
-      activeInjectorCleaner = startAnswerInjector(totalOptions, ctx.ui.notify.bind(ctx.ui));
 
       const collabUrl = getActiveCollabUrl();
       const sessionName = ctx.cwd ? path.basename(ctx.cwd) : "omp 会话";
